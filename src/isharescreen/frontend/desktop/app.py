@@ -23,7 +23,7 @@ from ...proxy.protocol.negotiation import AdvertiseDims
 from ...proxy.session import Session, SessionConfig
 from .audio_sink import make_audio_sink
 from .gpu import Renderer
-from .keymap import GLFW_KEY_TO_X11, glfw_button_to_rfb_bit
+from .keymap import glfw_button_to_rfb_bit, key_to_x11
 
 
 # X11 keysyms for the Cmd-equivalent (Super_L / Super_R). When Ctrl→Cmd
@@ -653,26 +653,9 @@ def run(
             if key == glfw.KEY_RIGHT_CONTROL:
                 session.input.key_event(action != glfw.RELEASE, _KEYSYM_SUPER_R)
                 return
-        keysym = GLFW_KEY_TO_X11.get(key, 0)
-        if keysym == 0:
-            # Printable key. Normally `on_char` handles these so the
-            # user's keyboard layout (Dvorak / AZERTY / Shift) is
-            # respected. But `on_char` does NOT fire when a modifier
-            # is held (e.g. Ctrl+C, Cmd+V), so we'd drop the letter
-            # and only forward the modifier press — host sees Ctrl
-            # held + Ctrl release, no C in between. Catch the
-            # modifier-held case here and synthesize a keysym for the
-            # raw ASCII letter / digit. X11 keysyms for A–Z and 0–9
-            # are just their ASCII codepoints.
-            held = mods & (glfw.MOD_CONTROL | glfw.MOD_SUPER | glfw.MOD_ALT)
-            if held and glfw.KEY_A <= key <= glfw.KEY_Z:
-                keysym = ord("a") + (key - glfw.KEY_A)
-            elif held and glfw.KEY_0 <= key <= glfw.KEY_9:
-                keysym = ord("0") + (key - glfw.KEY_0)
-            elif held and key == glfw.KEY_SPACE:
-                keysym = ord(" ")
-            else:
-                return
+        keysym = key_to_x11(key, mods)
+        if not keysym:
+            return
         session.input.key_event(action != glfw.RELEASE, keysym)
 
     def on_char(_w, codepoint):
@@ -817,17 +800,9 @@ def run(
                 if key == glfw.KEY_RIGHT_CONTROL:
                     session.input.key_event(action != glfw.RELEASE, _KEYSYM_SUPER_R)
                     return
-            keysym = GLFW_KEY_TO_X11.get(key, 0)
-            if keysym == 0:
-                held = mods & (glfw.MOD_CONTROL | glfw.MOD_SUPER | glfw.MOD_ALT)
-                if held and glfw.KEY_A <= key <= glfw.KEY_Z:
-                    keysym = ord("a") + (key - glfw.KEY_A)
-                elif held and glfw.KEY_0 <= key <= glfw.KEY_9:
-                    keysym = ord("0") + (key - glfw.KEY_0)
-                elif held and key == glfw.KEY_SPACE:
-                    keysym = ord(" ")
-                else:
-                    return
+            keysym = key_to_x11(key, mods)
+            if not keysym:
+                return
             session.input.key_event(action != glfw.RELEASE, keysym)
 
         def on_char2(_w, codepoint):

@@ -22,7 +22,8 @@ from ...proxy.protocol.rfb import BTN_LEFT, BTN_MIDDLE, BTN_RIGHT
 
 # Physical glfw key code → X11 keysym. Only special / non-printable
 # keys belong here; printable ASCII is routed through char_callback so
-# the user's keyboard layout is honoured.
+# the user's keyboard layout is honoured — except when Ctrl/Super/Alt
+# is held, because on_char does not fire then (see key_to_x11).
 GLFW_KEY_TO_X11: dict[int, int] = {
     glfw.KEY_ESCAPE:        0xff1b,
     glfw.KEY_TAB:           0xff09,
@@ -51,12 +52,43 @@ GLFW_KEY_TO_X11: dict[int, int] = {
     glfw.KEY_F4: 0xffc1, glfw.KEY_F5: 0xffc2, glfw.KEY_F6: 0xffc3,
     glfw.KEY_F7: 0xffc4, glfw.KEY_F8: 0xffc5, glfw.KEY_F9: 0xffc6,
     glfw.KEY_F10: 0xffc7, glfw.KEY_F11: 0xffc8, glfw.KEY_F12: 0xffc9,
-    # Space is intentionally NOT here — letting `on_key` send it would
-    # duplicate every spacebar press because `on_char` also fires for
-    # the space character. The modifier-held branch in `on_key`
-    # synthesises space when a modifier is down (Ctrl+Space, etc),
-    # since `on_char` doesn't fire under a modifier.
 }
+
+# glfw KEY_* for US-layout punctuation/digits equal the ASCII codepoint.
+# A–Z are 65–90; X11 letter keysyms are lowercase (97–122).
+_GLFW_PRINTABLE_ASCII = frozenset({
+    glfw.KEY_SPACE, glfw.KEY_APOSTROPHE, glfw.KEY_COMMA, glfw.KEY_MINUS,
+    glfw.KEY_PERIOD, glfw.KEY_SLASH, glfw.KEY_SEMICOLON, glfw.KEY_EQUAL,
+    glfw.KEY_LEFT_BRACKET, glfw.KEY_BACKSLASH, glfw.KEY_RIGHT_BRACKET,
+    glfw.KEY_GRAVE_ACCENT,
+    *range(glfw.KEY_0, glfw.KEY_9 + 1),
+})
+
+_MOD_SHORTCUT = glfw.MOD_CONTROL | glfw.MOD_SUPER | glfw.MOD_ALT
+
+
+def _printable_keysym(key: int) -> int:
+    if glfw.KEY_A <= key <= glfw.KEY_Z:
+        return ord("a") + (key - glfw.KEY_A)
+    if key in _GLFW_PRINTABLE_ASCII:
+        return key
+    return 0
+
+
+def key_to_x11(key: int, mods: int = 0) -> int:
+    """X11 keysym to put on the RFB wire for a glfw key event.
+
+    Special keys always map. Printable keys map only when Ctrl/Super/Alt
+    is held — otherwise `on_char` delivers the layout-correct codepoint
+    and mapping here would duplicate or ignore Dvorak/AZERTY.
+    Returns 0 if this event should be ignored (bare printable).
+    """
+    ks = GLFW_KEY_TO_X11.get(key, 0)
+    if ks:
+        return ks
+    if mods & _MOD_SHORTCUT:
+        return _printable_keysym(key)
+    return 0
 
 
 def glfw_button_to_rfb_bit(glfw_button: int) -> int:
@@ -71,4 +103,4 @@ def glfw_button_to_rfb_bit(glfw_button: int) -> int:
     return 0
 
 
-__all__ = ["GLFW_KEY_TO_X11", "glfw_button_to_rfb_bit"]
+__all__ = ["GLFW_KEY_TO_X11", "key_to_x11", "glfw_button_to_rfb_bit"]

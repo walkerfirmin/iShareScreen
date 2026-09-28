@@ -1,21 +1,19 @@
 """Per-platform "grab the keyboard while iss has focus" so OS-level
-shortcuts (GNOME Activities on bare Super, Windows Start menu on Win,
-Alt+Tab) don't intercept keys destined for the remote Mac.
+shortcuts (COSMIC/GNOME Super, Windows Start menu, Alt+Tab) don't
+intercept keys destined for the remote Mac.
 
 Same pattern remote-desktop clients use: grab on focus-in, release on
 focus-out. iss wires this into glfwSetWindowFocusCallback in app.py.
 
 Implementations:
+  Wayland  zwp_keyboard_shortcuts_inhibit_v1 via ctypes +
+           libwayland-client (COSMIC, GNOME, most wlroots compositors)
   X11      XGrabKeyboard via ctypes->libX11 (TigerVNC pattern)
   Win32    SetWindowsHookEx(WH_KEYBOARD_LL) via ctypes->user32
-  Wayland  unimplemented; would need pywayland +
-           zwp_keyboard_shortcuts_inhibit_v1. Falls through to no-op
-           with a warning. Use an X11 session for full grab on Linux.
 
-Default off — opt in with ISS_GRAB_KEYBOARD=1. The Win32 hook in
-particular intercepts every keystroke system-wide; it self-gates on
-foreground-window match to keep that cheap, but users who don't need
-it shouldn't pay for it.
+On by default from app.py (ISS_GRAB_KEYBOARD=0 to opt out). The Win32
+hook intercepts keystrokes system-wide while iss is foreground; it
+self-gates on the foreground window.
 """
 from __future__ import annotations
 
@@ -50,8 +48,8 @@ def make_grab(glfw_window, key_sender=None) -> KeyboardGrab:
     shortcuts). The X11 backend doesn't need it — XGrabKeyboard routes
     every key including Win+combos through GLFW's normal callback.
 
-    Returns a no-op on platforms we don't support (Mac, Linux/Wayland)
-    so callers can treat the result uniformly."""
+    Returns a no-op on platforms we don't support (macOS) so callers
+    can treat the result uniformly."""
     if sys.platform == "win32":
         if key_sender is None:
             return _NoopGrab("Win32 keyboard grab needs a key_sender callable")
@@ -62,8 +60,14 @@ def make_grab(glfw_window, key_sender=None) -> KeyboardGrab:
             return _NoopGrab(str(e))
 
     if sys.platform.startswith("linux"):
-        # Detect X11 vs Wayland by attempting the X11 native helpers.
-        # If they raise or return 0 the session is Wayland (or headless).
+        try:
+            import glfw  # type: ignore
+            if (getattr(glfw, "get_wayland_display", None)
+                    and glfw.get_wayland_display()
+                    and glfw.get_wayland_window(glfw_window)):
+                return _WaylandGrab(glfw_window)
+        except Exception as e:
+            log.debug("Wayland keyboard grab unavailable: %s", e)
         try:
             import glfw  # type: ignore
             disp = glfw.get_x11_display()
@@ -72,11 +76,11 @@ def make_grab(glfw_window, key_sender=None) -> KeyboardGrab:
         except Exception:
             pass
         return _NoopGrab(
-            "Wayland keyboard grab not implemented; switch to an X11 "
-            "session at login if you need iss to capture Win/Super combos"
+            "keyboard grab unavailable (need Wayland shortcuts-inhibit "
+            "or an X11 session)"
         )
 
-    return _NoopGrab("only Linux (X11) and Windows are supported")
+    return _NoopGrab("only Linux and Windows are supported")
 
 
 # ── no-op fallback ───────────────────────────────────────────────────
@@ -94,6 +98,323 @@ class _NoopGrab:
 
     def disable(self) -> None:
         return
+
+
+# ── Wayland implementation ───────────────────────────────────────────
+#
+# Native glfw-on-Wayland (the pyGLFW wheel loads wayland/libglfw.so when
+# XDG_SESSION_TYPE=wayland). XGrabKeyboard cannot see compositor-bound
+# shortcuts (Super, Alt+Tab); those never leave cosmic-comp / gnome-shell.
+# zwp_keyboard_shortcuts_inhibit_v1 is the protocol remote-desktop clients
+# use. COSMIC's compositor advertises it (smithay).
+#
+# We share GLFW's wl_display but bind registry/seat/manager on a *side
+# queue* so our roundtrip does not re-enter GLFW's event dispatch.
+
+_WL_MARSHAL_FLAG_DESTROY = 1
+_WL_DISPLAY_GET_REGISTRY = 1
+_WL_REGISTRY_BIND = 0
+_INHIBIT_MANAGER_INHIBIT = 1  # opcode; 0 is destroy
+
+
+class _WlInterface(ctypes.Structure):
+    pass
+
+
+class _WlMessage(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char_p),
+        ("signature", ctypes.c_char_p),
+        ("types", ctypes.POINTER(ctypes.POINTER(_WlInterface))),
+    ]
+
+
+_WlInterface._fields_ = [
+    ("name", ctypes.c_char_p),
+    ("version", ctypes.c_int),
+    ("method_count", ctypes.c_int),
+    ("methods", ctypes.POINTER(_WlMessage)),
+    ("event_count", ctypes.c_int),
+    ("events", ctypes.POINTER(_WlMessage)),
+]
+
+
+_GlobalFn = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+    ctypes.c_char_p, ctypes.c_uint32,
+)
+_GlobalRemoveFn = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+)
+_InhibitorEventFn = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class _RegistryListener(ctypes.Structure):
+    _fields_ = [
+        ("global_", _GlobalFn),
+        ("global_remove", _GlobalRemoveFn),
+    ]
+
+
+class _InhibitorListener(ctypes.Structure):
+    _fields_ = [
+        ("active", _InhibitorEventFn),
+        ("inactive", _InhibitorEventFn),
+    ]
+
+
+def _fill_wl_messages(entries: list):
+    """Build a wl_message array. `entries` is (name, signature, types_or_None)."""
+    msgs = (_WlMessage * max(len(entries), 1))()
+    kept = []
+    for i, (mname, sig, types) in enumerate(entries):
+        msgs[i].name = mname
+        msgs[i].signature = sig
+        if types:
+            arr = (ctypes.POINTER(_WlInterface) * len(types))(*types)
+            kept.append(arr)
+            msgs[i].types = ctypes.cast(
+                arr, ctypes.POINTER(ctypes.POINTER(_WlInterface)))
+        else:
+            msgs[i].types = None
+    return msgs, kept
+
+
+def _wl_iface(
+    name: bytes,
+    version: int,
+    methods: list,
+    events: list | None = None,
+) -> _WlInterface:
+    """Build a wl_interface that stays alive (caller must keep the result
+    and any arrays it points at). `methods`/`events` are lists of
+    (name, signature, types_tuple_or_None).
+
+    Events must be declared even if we never listen: libwayland demarshals
+    compositor messages against this table during wl_display_read_events
+    (GLFW's poll). An inhibitor with event_count=0 dies the connection
+    the moment the compositor sends active/inactive (typically on focus).
+    """
+    events = events or []
+    method_msgs, method_kept = _fill_wl_messages(methods)
+    event_msgs, event_kept = _fill_wl_messages(events) if events else (None, [])
+    iface = _WlInterface()
+    iface.name = name
+    iface.version = version
+    iface.method_count = len(methods)
+    iface.methods = method_msgs
+    iface.event_count = len(events)
+    iface.events = event_msgs
+    iface._kept = method_kept + event_kept  # pin types arrays against GC
+    iface._msgs = method_msgs
+    iface._event_msgs = event_msgs
+    return iface
+
+
+class _WaylandGrab:
+    """Ask the compositor to stop handling its own shortcuts while the
+    iss window has keyboard focus (Super, Alt+Tab, etc. go to the Mac)."""
+
+    def __init__(self, glfw_window) -> None:
+        import glfw  # type: ignore
+        try:
+            wlc = ctypes.CDLL("libwayland-client.so.0")
+        except OSError as e:
+            raise RuntimeError(f"libwayland-client.so.0 not found: {e}") from e
+
+        self._wlc = wlc
+        self._display = glfw.get_wayland_display()
+        self._surface = glfw.get_wayland_window(glfw_window)
+        if not self._display or not self._surface:
+            raise RuntimeError("glfw Wayland native handles unavailable")
+
+        wlc.wl_proxy_marshal_flags.restype = ctypes.c_void_p
+        wlc.wl_proxy_create_wrapper.restype = ctypes.c_void_p
+        wlc.wl_proxy_create_wrapper.argtypes = [ctypes.c_void_p]
+        wlc.wl_proxy_set_queue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        wlc.wl_proxy_wrapper_destroy.argtypes = [ctypes.c_void_p]
+        wlc.wl_proxy_destroy.argtypes = [ctypes.c_void_p]
+        wlc.wl_proxy_add_listener.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        wlc.wl_proxy_add_listener.restype = ctypes.c_int
+        wlc.wl_display_create_queue.restype = ctypes.c_void_p
+        wlc.wl_display_create_queue.argtypes = [ctypes.c_void_p]
+        wlc.wl_display_roundtrip_queue.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p]
+        wlc.wl_display_roundtrip_queue.restype = ctypes.c_int
+        wlc.wl_display_flush.argtypes = [ctypes.c_void_p]
+        wlc.wl_display_flush.restype = ctypes.c_int
+
+        self._registry_iface = _WlInterface.in_dll(wlc, "wl_registry_interface")
+        self._seat_iface = _WlInterface.in_dll(wlc, "wl_seat_interface")
+        self._surface_iface = _WlInterface.in_dll(wlc, "wl_surface_interface")
+
+        self._inhibitor_iface = _wl_iface(
+            b"zwp_keyboard_shortcuts_inhibitor_v1", 1,
+            [(b"destroy", b"", None)],
+            [(b"active", b"", None), (b"inactive", b"", None)],
+        )
+        inh_ptr = ctypes.pointer(self._inhibitor_iface)
+        surf_ptr = ctypes.pointer(self._surface_iface)
+        seat_ptr = ctypes.pointer(self._seat_iface)
+        self._manager_iface = _wl_iface(
+            b"zwp_keyboard_shortcuts_inhibit_manager_v1", 1,
+            [
+                (b"destroy", b"", None),
+                (b"inhibit_shortcuts", b"noo", (inh_ptr, surf_ptr, seat_ptr)),
+            ],
+        )
+
+        self._queue = None
+        self._registry = None
+        self._manager = None
+        self._seats: list = []
+        self._inhibitors: list = []
+        self._inh_listeners: list = []
+        self._inh_cbs: list = []
+        self._held = False
+        self._listener = None
+        self._cb_global = None
+        self._cb_remove = None
+        atexit.register(self._safety_release)
+        self._bind_globals()
+        if self._manager is None or not self._seats:
+            raise RuntimeError(
+                "compositor does not advertise "
+                "zwp_keyboard_shortcuts_inhibit_manager_v1"
+            )
+
+    def _bind(self, registry, name: int, iface: _WlInterface, version: int):
+        return self._wlc.wl_proxy_marshal_flags(
+            registry, _WL_REGISTRY_BIND, ctypes.byref(iface), version, 0,
+            ctypes.c_uint32(name), iface.name, ctypes.c_uint32(version), None,
+        )
+
+    def _bind_globals(self) -> None:
+        wlc = self._wlc
+        queue = wlc.wl_display_create_queue(self._display)
+        if not queue:
+            raise RuntimeError("wl_display_create_queue failed")
+        wrapper = wlc.wl_proxy_create_wrapper(self._display)
+        if not wrapper:
+            raise RuntimeError("wl_proxy_create_wrapper failed")
+        wlc.wl_proxy_set_queue(wrapper, queue)
+        registry = wlc.wl_proxy_marshal_flags(
+            wrapper, _WL_DISPLAY_GET_REGISTRY,
+            ctypes.byref(self._registry_iface), 1, 0, None,
+        )
+        wlc.wl_proxy_wrapper_destroy(wrapper)
+        if not registry:
+            raise RuntimeError("wl_display_get_registry failed")
+        wlc.wl_proxy_set_queue(registry, queue)
+
+        seats: list = []
+        manager_box: list = []
+
+        @_GlobalFn
+        def on_global(_data, registry, name, interface, version):
+            if not interface:
+                return
+            iface = interface.decode("utf-8", "replace") if isinstance(
+                interface, (bytes, bytearray)) else str(interface)
+            if iface == "zwp_keyboard_shortcuts_inhibit_manager_v1":
+                manager_box.append(
+                    self._bind(registry, name, self._manager_iface, 1))
+            elif iface == "wl_seat":
+                seats.append(self._bind(
+                    registry, name, self._seat_iface, min(int(version), 1)))
+
+        @_GlobalRemoveFn
+        def on_remove(_data, _registry, _name):
+            return
+
+        listener = _RegistryListener(on_global, on_remove)
+        wlc.wl_proxy_add_listener(
+            registry, ctypes.byref(listener), None)
+        if wlc.wl_display_roundtrip_queue(self._display, queue) < 0:
+            raise RuntimeError("wl_display_roundtrip_queue failed")
+
+        self._queue = queue
+        self._registry = registry
+        self._manager = manager_box[0] if manager_box else None
+        self._seats = [s for s in seats if s]
+        self._cb_global = on_global
+        self._cb_remove = on_remove
+        self._listener = listener
+        log.debug(
+            "Wayland shortcuts-inhibit: manager=%s seats=%d",
+            bool(self._manager), len(self._seats),
+        )
+
+    def enable(self) -> bool:
+        if self._held:
+            return True
+        wlc = self._wlc
+
+        @_InhibitorEventFn
+        def on_active(_data, _inhibitor):
+            log.debug("shortcuts-inhibit: compositor reports active")
+
+        @_InhibitorEventFn
+        def on_inactive(_data, _inhibitor):
+            log.debug("shortcuts-inhibit: compositor reports inactive")
+
+        for seat in self._seats:
+            inh = wlc.wl_proxy_marshal_flags(
+                self._manager, _INHIBIT_MANAGER_INHIBIT,
+                ctypes.byref(self._inhibitor_iface), 1, 0,
+                None, ctypes.c_void_p(self._surface), ctypes.c_void_p(seat),
+            )
+            if not inh:
+                log.warning("inhibit_shortcuts returned NULL")
+                continue
+            listener = _InhibitorListener(on_active, on_inactive)
+            wlc.wl_proxy_add_listener(
+                inh, ctypes.byref(listener), None)
+            self._inhibitors.append(inh)
+            self._inh_listeners.append(listener)
+        if not self._inhibitors:
+            return False
+        self._inh_cbs.append((on_active, on_inactive))
+        self._held = True
+        # Flush only — do not roundtrip here. enable() runs from GLFW's
+        # focus callback, inside wl_display_dispatch; a nested roundtrip
+        # would re-enter the same connection.
+        wlc.wl_display_flush(self._display)
+        log.info(
+            "keyboard grab acquired (Wayland shortcuts-inhibit; "
+            "compositor Super/Alt+Tab go to the Mac while iss is focused)"
+        )
+        return True
+
+    def disable(self) -> None:
+        if not self._held:
+            return
+        wlc = self._wlc
+        for inh in self._inhibitors:
+            try:
+                wlc.wl_proxy_marshal_flags(
+                    inh, 0, None, 0, _WL_MARSHAL_FLAG_DESTROY)
+            except Exception:
+                try:
+                    wlc.wl_proxy_destroy(inh)
+                except Exception:
+                    pass
+        self._inhibitors.clear()
+        self._inh_listeners.clear()
+        self._inh_cbs.clear()
+        self._held = False
+        try:
+            wlc.wl_display_flush(self._display)
+        except Exception:
+            pass
+        log.info("keyboard grab released (Wayland)")
+
+    def _safety_release(self) -> None:
+        try:
+            self.disable()
+        except Exception:
+            pass
 
 
 # ── X11 implementation ───────────────────────────────────────────────
