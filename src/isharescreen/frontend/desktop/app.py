@@ -282,6 +282,11 @@ def run(
     the common case is unchanged. `display_all=False` (--display combined)
     keeps the whole stacked canvas in one window."""
     log.info("opening desktop frontend → %s", config.host)
+    # Must run before any glfw.init() (e.g. _auto_advertise_dims). Cursor
+    # often exports GDK_BACKEND=x11; if libdecor-gtk loads under that, it
+    # fails once and later windows stay undecorated even if we fix the env.
+    _ensure_wayland_gdk_backend()
+    _warn_libdecor_plugins()
     # In display_all/auto mode we deliberately DON'T force `display` to a monitor
     # index here. Doing so would disable dynamic resolution (below) for every
     # host — including single-monitor hosts, where we can't yet know the count
@@ -425,10 +430,6 @@ def run(
     adv = config.advertise
     win_w = (adv.width if adv else 0) or scaled_w or canvas_w
     win_h = (adv.height if adv else 0) or scaled_h or canvas_h
-    # Before GLFW/libdecor loads: fix GDK_BACKEND and warn about missing
-    # decoration plugins (undecorated Wayland surfaces can vanish on close).
-    _ensure_wayland_gdk_backend()
-    _warn_libdecor_plugins()
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
