@@ -77,6 +77,72 @@ def _even(n: int) -> int:
     return n - (n & 1)
 
 
+def _ensure_wayland_gdk_backend() -> None:
+    """Make libdecor-gtk able to init under a Wayland session.
+
+    Cursor/Electron often export ``GDK_BACKEND=x11`` into child processes.
+    That breaks libdecor-gtk ("Failed to initialize GTK"), so GLFW falls
+    back to an undecorated surface. On COSMIC, an undecorated toplevel can
+    still receive ``xdg_toplevel.close`` and vanish with no ERROR log.
+    """
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return
+    prev = (os.environ.get("GDK_BACKEND") or "").strip().lower()
+    if prev == "x11":
+        os.environ["GDK_BACKEND"] = "wayland"
+        log.warning(
+            "GDK_BACKEND was 'x11' (common when launched from Cursor/"
+            "Electron); forcing 'wayland' so libdecor can decorate the "
+            "GLFW window. Without decorations the compositor may close "
+            "the surface unexpectedly."
+        )
+    elif not prev:
+        os.environ["GDK_BACKEND"] = "wayland"
+
+
+def _warn_libdecor_plugins() -> None:
+    """Warn when Wayland has no usable libdecor plugin fallback.
+
+    Only the GTK plugin is commonly installed; if it fails to init and
+    the cairo plugin is missing, GLFW runs with no decorations.
+    """
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return
+    plugin_dirs = (
+        "/usr/lib/x86_64-linux-gnu/libdecor/plugins-1",
+        "/usr/lib/aarch64-linux-gnu/libdecor/plugins-1",
+        "/usr/lib/libdecor/plugins-1",
+        "/usr/lib64/libdecor/plugins-1",
+    )
+    found: list[str] = []
+    for d in plugin_dirs:
+        try:
+            for name in os.listdir(d):
+                if name.startswith("libdecor-") and name.endswith(".so"):
+                    found.append(name)
+        except OSError:
+            continue
+    if not found:
+        log.warning(
+            "no libdecor plugins found — GLFW window will have no "
+            "client-side decorations on Wayland. Install "
+            "libdecor-0-plugin-1-gtk and/or libdecor-0-plugin-1-cairo "
+            "(see docs/setup-popos.md). Undecorated surfaces are more "
+            "likely to be closed by the compositor without warning."
+        )
+        return
+    has_cairo = any("cairo" in n for n in found)
+    has_gtk = any("gtk" in n for n in found)
+    if has_gtk and not has_cairo:
+        log.warning(
+            "libdecor has GTK plugin only (%s); if libdecor-gtk fails to "
+            "init (e.g. GDK_BACKEND=x11), there is no fallback and the "
+            "window runs undecorated. Install libdecor-0-plugin-1-cairo "
+            "for a non-GTK fallback.",
+            ", ".join(sorted(set(found))),
+        )
+
+
 def _auto_advertise_dims() -> tuple[int, int]:
     """Initial virtual-display size when no fixed --advertise was given:
     ~85% of the primary monitor's work area (its usable region, minus
@@ -359,6 +425,10 @@ def run(
     adv = config.advertise
     win_w = (adv.width if adv else 0) or scaled_w or canvas_w
     win_h = (adv.height if adv else 0) or scaled_h or canvas_h
+    # Before GLFW/libdecor loads: fix GDK_BACKEND and warn about missing
+    # decoration plugins (undecorated Wayland surfaces can vanish on close).
+    _ensure_wayland_gdk_backend()
+    _warn_libdecor_plugins()
     window = RenderCanvas(title=title, size=(win_w, win_h), max_fps=120)
     glfw_window = window._window  # for raw glfw input callbacks only
     # Lock the window to the content's aspect ratio so the stream always fills
@@ -680,6 +750,13 @@ def run(
     # Alt+Tab go to the remote Mac instead of the local desktop. On by
     # default; opt out with ISS_GRAB_KEYBOARD=0 (e.g. when debugging
     # local shortcuts while iss is foreground).
+    #
+    # Desired grab state is set from the focus callback; enable/disable
+    # run in the main loop AFTER glfw.poll_events() so Wayland
+    # inhibit marshal/flush never nests inside wl_display_dispatch
+    # (nested traffic can protocol-error the connection and make the
+    # window vanish with no ERROR).
+    _grab_want = {"v": False}
     if os.environ.get("ISS_GRAB_KEYBOARD", "1") != "0":
         from .keyboard_grab import make_grab
         # The Win32 backend needs to deliver intercepted keys directly
@@ -690,19 +767,29 @@ def run(
             glfw_window,
             key_sender=lambda is_down, ks: session.input.key_event(is_down, ks),
         )
-        # Initial enable if window already focused at startup.
-        if glfw.get_window_attrib(glfw_window, glfw.FOCUSED):
-            kbd_grab.enable()
+        _grab_want["v"] = bool(
+            glfw.get_window_attrib(glfw_window, glfw.FOCUSED))
 
         def on_window_focus(_w, focused):
-            if focused:
-                kbd_grab.enable()
-            else:
-                kbd_grab.disable()
+            _grab_want["v"] = bool(focused)
 
         glfw.set_window_focus_callback(glfw_window, on_window_focus)
     else:
         kbd_grab = None
+
+    # Log compositor/user close requests (xdg_toplevel.close → GLFW
+    # sets should_close). We still allow the close — this is only for
+    # triage when the window "vanishes on its own".
+    _close_requested = {"v": False}
+
+    def on_window_close(_w):
+        _close_requested["v"] = True
+        log.info("window close requested (compositor or user)")
+
+    try:
+        glfw.set_window_close_callback(glfw_window, on_window_close)
+    except Exception as e:
+        log.debug("set_window_close_callback failed: %s", e)
 
     # ── secondary windows (multi-monitor: one window per host monitor) ──────
     # Each secondary shows a FIXED crop of the SAME decoded canvas — no extra
@@ -1262,8 +1349,18 @@ def run(
                 log.error("send_dynamic_resolution failed: %s", e)
                 return
 
+    _loop_start = time.monotonic()
+    # Default if the while condition fails (auto_quit_secs deadline).
+    _exit_reason = "auto_quit"
+
     while time.monotonic() < deadline:
         glfw.poll_events()
+        # Apply deferred keyboard grab outside GLFW's Wayland dispatch.
+        if kbd_grab is not None:
+            if _grab_want["v"]:
+                kbd_grab.enable()
+            else:
+                kbd_grab.disable()
         _apply_pending_cursor()
         # Hide the local OS cursor only once the overlay can actually draw —
         # a shape has been uploaded (_last_cursor_img) AND a pointer position
@@ -1279,15 +1376,29 @@ def run(
                 _os_cursor_hidden["v"] = True
             except Exception as e:
                 log.debug("could not hide local cursor: %s", e)
-        if window.get_closed() or glfw.window_should_close(glfw_window):
+        _rc_closed = False
+        try:
+            _rc_closed = bool(window.get_closed())
+        except Exception:
+            _rc_closed = False
+        _glfw_close = bool(glfw.window_should_close(glfw_window))
+        if _rc_closed or _glfw_close:
+            if _glfw_close and not _rc_closed:
+                _exit_reason = "glfw_should_close"
+            elif _rc_closed and not _glfw_close:
+                _exit_reason = "rendercanvas_get_closed"
+            else:
+                _exit_reason = "glfw_should_close"
             break
         if _device_lost["v"]:
+            _exit_reason = "device_lost"
             break
 
         if _dynamic[0]:
             _poll_resize()
         if not session.is_connected:
             log.error("connection lost — closing viewer")
+            _exit_reason = "connection_lost"
             break
 
         # Detect canvas changes from 0x451 handler.
@@ -1400,7 +1511,32 @@ def run(
             _last_drawn_cursor = cursor
             _cursor_dirty["v"] = False
 
-    log.info("desktop frontend closing")
+    # Exit triage: distinguish compositor close vs disconnect vs GPU loss.
+    try:
+        _fw = bool(glfw.get_window_attrib(glfw_window, glfw.FOCUSED))
+    except Exception:
+        _fw = False
+    try:
+        _wsz = glfw.get_window_size(glfw_window)
+    except Exception:
+        _wsz = (0, 0)
+    _grab_held = bool(getattr(kbd_grab, "_held", False)) if kbd_grab else False
+    _uptime = time.monotonic() - _loop_start
+    _resize_age = (
+        (time.monotonic() - last_resize_t) if last_resize_t > 0 else None
+    )
+    log.info(
+        "desktop frontend closing: reason=%s close_callback=%s "
+        "focused=%s grab_held=%s window=%dx%d uptime=%.1fs "
+        "last_resize_age=%s",
+        _exit_reason,
+        _close_requested["v"],
+        _fw,
+        _grab_held,
+        _wsz[0], _wsz[1],
+        _uptime,
+        f"{_resize_age:.1f}s" if _resize_age is not None else "n/a",
+    )
     for sv in secondaries:
         try:
             sv.window.close()

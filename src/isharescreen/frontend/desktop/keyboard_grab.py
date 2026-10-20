@@ -377,9 +377,10 @@ class _WaylandGrab:
             return False
         self._inh_cbs.append((on_active, on_inactive))
         self._held = True
-        # Flush only — do not roundtrip here. enable() runs from GLFW's
-        # focus callback, inside wl_display_dispatch; a nested roundtrip
-        # would re-enter the same connection.
+        # Flush only — do not roundtrip. app.py defers enable() until
+        # after glfw.poll_events() so we are outside wl_display_dispatch,
+        # but a nested roundtrip would still be unsafe if call sites
+        # change.
         wlc.wl_display_flush(self._display)
         log.info(
             "keyboard grab acquired (Wayland shortcuts-inhibit; "

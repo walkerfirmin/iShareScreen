@@ -224,6 +224,52 @@ shortcuts-inhibit)` in the log. Click the window first. Do **not** set
 COSMIC permission toast appears, allow it. Opt out of the grab with
 `ISS_GRAB_KEYBOARD=0`.
 
+### Window decorations (libdecor) — avoid “vanished” windows
+
+GLFW on Wayland needs **libdecor** for title-bar / close chrome. If
+libdecor-gtk fails to init you will see:
+
+```text
+libdecor-gtk-WARNING: Failed to initialize GTK
+Failed to load plugin 'libdecor-gtk.so': failed to init
+No plugins found, falling back on no decorations
+```
+
+An undecorated surface can still receive COSMIC’s
+`xdg_toplevel.close` and the viewer exits with a clean
+`desktop frontend closing: reason=glfw_should_close` — it looks like
+the window vanished on its own.
+
+**Fixes:**
+
+1. Prefer launching from a normal terminal (not Cursor’s integrated
+   terminal). Cursor/Electron often exports `GDK_BACKEND=x11`, which
+   breaks libdecor-gtk. `iss` forces `GDK_BACKEND=wayland` when
+   `WAYLAND_DISPLAY` is set, but a native terminal is still the
+   cleanest check.
+2. Install a non-GTK fallback plugin:
+
+```sh
+sudo apt install libdecor-0-plugin-1-cairo
+```
+
+3. Confirm decorations appear (title bar / close button) after
+   connect. You should **not** see the libdecor-gtk warning above.
+
+### If the window still vanishes — triage A/B
+
+On exit, the log now includes an explicit reason, e.g.:
+
+```text
+desktop frontend closing: reason=glfw_should_close close_callback=True ...
+```
+
+| What to try | Why |
+|-------------|-----|
+| Launch from a normal terminal; check decorations | Rules out Cursor `GDK_BACKEND` / undecorated close |
+| `ISS_GRAB_KEYBOARD=0 iss … --frontend desktop` | If vanishes stop, grab/compositor interaction is implicated |
+| `PYGLFW_LIBRARY_VARIANT=x11 iss …` | Isolates native Wayland glfw (you lose shortcut pass-through) |
+
 If the window is blank or never appears, try forcing X11 glfw (you
 lose compositor shortcut pass-through):
 

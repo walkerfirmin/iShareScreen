@@ -10,7 +10,7 @@ available.
 ### On the host Mac (the target you want to view)
 
 1. Any modern macOS that supports the Screen Sharing app's High
-   Performance mode (Apple Silicon, recent macOS).
+  Performance mode (Apple Silicon, recent macOS).
 2. *System Settings → General → Sharing → **Screen Sharing*** → toggle on.
 
 ### On the viewing machine
@@ -18,27 +18,25 @@ available.
 #### macOS
 
 1. Install Python 3.10 or later (from [python.org](https://www.python.org/downloads/),
-   `brew install python`, or `uv python install 3.13`).
+  `brew install python`, or `uv python install 3.13`).
 2. Install iShareScreen:
-   ```sh
+  ```sh
    pip install git+https://github.com/renegadelink/iShareScreen.git
-   ```
+  ```
+
+
 
 #### Windows
 
 1. Install Python 3.10 or later from [python.org](https://www.python.org/downloads/)
-   (the installer includes pip; check "Add python.exe to PATH" during install).
+  (the installer includes pip; check "Add python.exe to PATH" during install).
 2. Open PowerShell or cmd and run:
-   ```sh
+  ```sh
    pip install git+https://github.com/renegadelink/iShareScreen.git
-   ```
-
+  ```
 3. (Optional, only if you want audio) install **libfdk-aac** — Apple's
-   PT=101 audio uses AAC-ELD-SBR, which Windows Media Foundation can't
+  PT=101 audio uses AAC-ELD-SBR, which Windows Media Foundation can't
    decode. The cleanest source is [MSYS2](https://www.msys2.org):
-   ```sh
-   pacman -Sy --noconfirm mingw-w64-x86_64-fdk-aac
-   ```
    This drops `libfdk-aac-2.dll` at `C:\msys64\mingw64\bin\`, which iss
    searches automatically. If you already have [scoop](https://scoop.sh),
    `scoop install msys2` followed by the same `pacman` command also
@@ -46,36 +44,30 @@ available.
    too. Without libfdk-aac, video works as normal and audio is silently
    skipped.
 
+
+
 #### Linux (Debian / Ubuntu)
 
 1. Install Python and the system libraries that the GPU + window stack
-   need (Vulkan loader, OpenGL, X11 / Wayland surfaces, PortAudio,
+  need (Vulkan loader, OpenGL, X11 / Wayland surfaces, PortAudio,
    AAC-ELD-SBR audio decoder):
-   ```sh
-   sudo apt install python3 python3-pip python3-venv \
-       libvulkan1 libgl1 libegl1 \
-       libxrandr2 libxinerama1 libxcursor1 libxi6 \
-       libportaudio2 libfdk-aac2 \
-       xclip
-   ```
    `libfdk-aac2` is only used for audio; if you skip it, video still
    works and audio is silently disabled.
-
    `xclip` enables bidirectional clipboard sync with the macOS host. On
    Wayland desktops use `wl-clipboard` instead. If neither is installed
    iss logs a one-line warning at startup and runs without clipboard
    sync — everything else still works.
 2. (Optional, for hardware HEVC decode on Intel GPUs) install vaapi:
-   ```sh
+  ```sh
    sudo apt install vainfo intel-media-va-driver-non-free
-   ```
+  ```
    For AMD, swap the driver: `sudo apt install mesa-va-drivers`.
 3. Install iShareScreen (in a venv recommended):
-   ```sh
+  ```sh
    python3 -m venv ~/.venvs/iss
    ~/.venvs/iss/bin/pip install git+https://github.com/renegadelink/iShareScreen.git
    ~/.venvs/iss/bin/iss     # or symlink to ~/.local/bin
-   ```
+  ```
 
 For Fedora / Arch / openSUSE, translate the apt package names with your
 distro's package manager (most are named the same or very close).
@@ -114,6 +106,10 @@ For CI / scripted use:
 
 ```sh
 echo "$PASSWORD" | iss --headless --host mac.local -u me --password-stdin --auto-quit-secs 30
+```
+
+```sh
+iss --host 192.168.1.113 -u admin --password-stdin --frontend desktop
 ```
 
 ## License
